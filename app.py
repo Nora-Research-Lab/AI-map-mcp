@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI
@@ -33,6 +34,12 @@ map_engine = MapEngine()
 
 mcp = FastMCP(
     name=APP_NAME,
+    # We mount this server under "/mcp" on the FastAPI app below.
+    # FastMCP's own default internal route is ALSO "/mcp", so leaving
+    # this unset produces a real endpoint at /mcp/mcp instead of /mcp.
+    # Setting it to "/" here means the mount prefix ("/mcp") becomes
+    # the actual, correct endpoint path.
+    streamable_http_path="/",
 )
 
 
@@ -598,6 +605,27 @@ def render_map() -> Dict[str, Any]:
 # FASTAPI APPLICATION
 # ============================================================
 
+# Build the MCP ASGI sub-app *before* the FastAPI app so we can wire
+# its session manager into our lifespan (see note below).
+mcp_app = mcp.streamable_http_app()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # FastMCP's streamable_http_app() normally starts its session
+    # manager's task group via its own Starlette lifespan handler.
+    # That only fires when the app is run directly with uvicorn.
+    # When it's *mounted* inside another app (as we do below),
+    # the parent app's lifespan does not automatically trigger it,
+    # so every request fails with:
+    #   RuntimeError: Task group is not initialized. Make sure to use run().
+    # Running mcp.session_manager.run() inside our own lifespan fixes
+    # that: it starts before the app accepts requests and stops on
+    # shutdown, matching what FastMCP would do if it were standalone.
+    async with mcp.session_manager.run():
+        yield
+
+
 app = FastAPI(
     title=APP_NAME,
     version=APP_VERSION,
@@ -605,6 +633,7 @@ app = FastAPI(
         "An MCP server that gives AI systems the ability to create, "
         "edit, analyze and export 2D maps and scientific visualizations."
     ),
+    lifespan=lifespan,
 )
 
 
@@ -731,27 +760,13 @@ async def map_json() -> JSONResponse:
 # MCP MOUNT
 # ============================================================
 
-# FastMCP exposes the MCP protocol through the ASGI application.
-#
-# The exact mounting mechanism depends on the installed MCP version.
-# We use the FastMCP streamable HTTP application here so the same
-# server can be consumed remotely by MCP-compatible clients.
-
-try:
-    mcp_app = mcp.streamable_http_app()
-
-    app.mount(
-        "/mcp",
-        mcp_app,
-    )
-
-except AttributeError:
-    # Compatibility fallback for MCP releases that expose the HTTP
-    # application differently.
-    #
-    # In that case the MCP server can still be launched through the
-    # FastMCP runner.
-    mcp_app = None
+# mcp_app was already built above (before the FastAPI app existed)
+# so its lifespan could be wired in. Mount it here, after all the
+# plain HTTP routes are registered.
+app.mount(
+    "/mcp",
+    mcp_app,
+)
 
 
 # ============================================================

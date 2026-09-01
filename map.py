@@ -1475,7 +1475,10 @@ class MapEngine:
 
         if feature_type == "GridLine":
 
-            value = geometry.get(
+            # GridLine features (built in add_grid) store "value"
+            # directly on the feature dict, not nested under
+            # "geometry" like Point/LineString/Polygon do.
+            value = feature.get(
                 "value"
             )
 
