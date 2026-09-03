@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from mcp.server.fastmcp import FastMCP
 
 from map import MapEngine
@@ -759,6 +759,23 @@ async def map_json() -> JSONResponse:
 # ============================================================
 # MCP MOUNT
 # ============================================================
+
+# Explicit OPTIONS handlers for the MCP endpoint. FastMCP's mounted
+# streamable-http route only declares GET, POST, DELETE, so a bare
+# OPTIONS request (the kind of capability probe some MCP clients,
+# including Claude's own connector setup flow, send before doing
+# anything else) hits the mount and gets a bare 405 back with no
+# CORS headers, since CORSMiddleware only handles OPTIONS requests
+# that carry an Origin header (real browser preflight) and otherwise
+# passes them straight through to the route. Registering these here,
+# before the mount, means they're matched first for OPTIONS
+# specifically, while GET/POST/DELETE continue through to the mount
+# exactly as before.
+@app.options("/mcp")
+@app.options("/mcp/")
+async def mcp_options() -> Response:
+    return Response(status_code=204, headers={"Allow": "OPTIONS, GET, POST, DELETE"})
+
 
 # mcp_app was already built above (before the FastAPI app existed)
 # so its lifespan could be wired in. Mount it here, after all the
