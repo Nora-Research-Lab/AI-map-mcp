@@ -1,5 +1,10 @@
 # Pinned to mcp 1.x: mcp>=2.0 renamed FastMCP to MCPServer and changed
 # the import path, which would break `from mcp.server.fastmcp import FastMCP`.
 mcp<2
-fastapi
+
+# app.py talks to Starlette directly (via mcp.server.fastmcp's
+# streamable_http_app()) rather than wrapping it in FastAPI, so
+# FastAPI itself is no longer a dependency here. starlette and
+# uvicorn are still needed directly.
+starlette
 uvicorn

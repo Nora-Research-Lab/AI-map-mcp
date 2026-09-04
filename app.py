@@ -1,20 +1,68 @@
+"""
+app.py
+------
+AI Map MCP server.
+
+This is a from-scratch rewrite of the MCP transport/wiring layer.
+The map/visualization engine itself lives in map.py and is unchanged
+in behavior; every tool below has the same name, signature, and
+capability as before.
+
+ARCHITECTURE
+============
+Earlier versions of this file wrapped FastMCP's generated app inside
+a *second*, separate FastAPI app via `outer_app.mount("/mcp", mcp_app)`.
+That composition caused three real, verified bugs:
+
+  1. FastMCP's own default internal route is ALSO "/mcp", so mounting
+     it again at "/mcp" produced an actual working endpoint at
+     "/mcp/mcp" instead of "/mcp".
+  2. FastMCP's session manager is started by *its own* Starlette
+     lifespan handler. That only fires when its app is run directly;
+     when mounted as a sub-app, the outer app's lifespan doesn't
+     trigger it, so every request failed with
+     "RuntimeError: Task group is not initialized."
+  3. The mounted route only declares GET/POST/DELETE. A bare OPTIONS
+     request (no Origin header — the kind of capability probe some
+     MCP clients send before doing anything else, including Claude's
+     own connector setup flow) isn't a CORS preflight, so
+     CORSMiddleware passes it straight through to the route, which
+     has no OPTIONS handler and returns a bare 405.
+
+This version avoids the first two bugs *by construction*, by never
+creating a second outer app at all: `mcp.streamable_http_app()` is
+used directly as the ASGI app that uvicorn runs, and the plain HTTP
+endpoints (health check, map viewer, etc.) are registered on that
+same app via `@mcp.custom_route(...)` instead of being routes on a
+separate FastAPI instance. There is exactly one Starlette app, one
+lifespan, and one "/mcp" path — no mount, no redirect, no wiring to
+get wrong.
+
+The third bug (OPTIONS/405) is still a real gap in what FastMCP
+generates, so it's fixed explicitly below with a dedicated OPTIONS
+route, the same way as before.
+
+See AGENT.md for the full write-up of these gotchas, the MCP
+transport conventions this server follows, and the verification
+recipe used to confirm the server behaves correctly end to end.
+"""
+
 from __future__ import annotations
 
-import json
 import os
-from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from starlette.middleware.cors import CORSMiddleware
+from starlette.requests import Request
+from starlette.responses import HTMLResponse, JSONResponse, Response
+
 from mcp.server.fastmcp import FastMCP
 
 from map import MapEngine
 
 
 # ============================================================
-# Configuration
+# CONFIGURATION
 # ============================================================
 
 APP_NAME = "AI Map MCP"
@@ -23,8 +71,7 @@ APP_VERSION = "1.0.0"
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "8000"))
 
-# Shared map engine.
-# The engine maintains the current canvas/map state.
+# Shared map engine. The engine maintains the current canvas/map state.
 map_engine = MapEngine()
 
 
@@ -34,12 +81,11 @@ map_engine = MapEngine()
 
 mcp = FastMCP(
     name=APP_NAME,
-    # We mount this server under "/mcp" on the FastAPI app below.
-    # FastMCP's own default internal route is ALSO "/mcp", so leaving
-    # this unset produces a real endpoint at /mcp/mcp instead of /mcp.
-    # Setting it to "/" here means the mount prefix ("/mcp") becomes
-    # the actual, correct endpoint path.
-    streamable_http_path="/",
+    # This is the one and only path the MCP protocol is served on.
+    # No outer app, no mount, so this is exactly the request path a
+    # client uses — matching the "https://mcp.example.com/mcp" style
+    # example Claude's own connector setup shows.
+    streamable_http_path="/mcp",
 )
 
 
@@ -73,7 +119,7 @@ def create_map(
     Coordinates supplied to other tools use the map's coordinate system.
     """
 
-    result = map_engine.create_map(
+    return map_engine.create_map(
         width=width,
         height=height,
         coordinate_system=coordinate_system,
@@ -85,8 +131,6 @@ def create_map(
         grid_spacing=grid_spacing,
         title=title,
     )
-
-    return result
 
 
 @mcp.tool()
@@ -602,99 +646,49 @@ def render_map() -> Dict[str, Any]:
 
 
 # ============================================================
-# FASTAPI APPLICATION
+# PLAIN HTTP ENDPOINTS
 # ============================================================
+# Registered directly on the MCP app via @mcp.custom_route, so they
+# live on the exact same Starlette app/lifespan as the MCP endpoint
+# itself — no second app, no mount.
 
-# Build the MCP ASGI sub-app *before* the FastAPI app so we can wire
-# its session manager into our lifespan (see note below).
-mcp_app = mcp.streamable_http_app()
+@mcp.custom_route("/", methods=["GET"])
+async def root(request: Request) -> JSONResponse:
+    """Basic service information."""
 
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # FastMCP's streamable_http_app() normally starts its session
-    # manager's task group via its own Starlette lifespan handler.
-    # That only fires when the app is run directly with uvicorn.
-    # When it's *mounted* inside another app (as we do below),
-    # the parent app's lifespan does not automatically trigger it,
-    # so every request fails with:
-    #   RuntimeError: Task group is not initialized. Make sure to use run().
-    # Running mcp.session_manager.run() inside our own lifespan fixes
-    # that: it starts before the app accepts requests and stops on
-    # shutdown, matching what FastMCP would do if it were standalone.
-    async with mcp.session_manager.run():
-        yield
+    return JSONResponse(
+        {
+            "name": APP_NAME,
+            "version": APP_VERSION,
+            "description": "AI-native mapping and visualization MCP server.",
+            "mcp_endpoint": "/mcp",
+            "status": "online",
+        }
+    )
 
 
-app = FastAPI(
-    title=APP_NAME,
-    version=APP_VERSION,
-    description=(
-        "An MCP server that gives AI systems the ability to create, "
-        "edit, analyze and export 2D maps and scientific visualizations."
-    ),
-    lifespan=lifespan,
-)
+@mcp.custom_route("/health", methods=["GET"])
+async def health(request: Request) -> JSONResponse:
+    """Health-check endpoint for deployment platforms."""
+
+    return JSONResponse(
+        {
+            "status": "healthy",
+            "service": APP_NAME,
+            "version": APP_VERSION,
+        }
+    )
 
 
-# ============================================================
-# CORS
-# ============================================================
+@mcp.custom_route("/state", methods=["GET"])
+async def state(request: Request) -> JSONResponse:
+    """HTTP endpoint for retrieving the current map state."""
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+    return JSONResponse(map_engine.get_state())
 
 
-# ============================================================
-# BASIC HTTP ENDPOINTS
-# ============================================================
-
-@app.get("/")
-async def root() -> Dict[str, Any]:
-    """
-    Basic service information.
-    """
-
-    return {
-        "name": APP_NAME,
-        "version": APP_VERSION,
-        "description": (
-            "AI-native mapping and visualization MCP server."
-        ),
-        "mcp_endpoint": "/mcp",
-        "status": "online",
-    }
-
-
-@app.get("/health")
-async def health() -> Dict[str, Any]:
-    """
-    Health-check endpoint for deployment platforms.
-    """
-
-    return {
-        "status": "healthy",
-        "service": APP_NAME,
-        "version": APP_VERSION,
-    }
-
-
-@app.get("/state")
-async def state() -> Dict[str, Any]:
-    """
-    HTTP endpoint for retrieving the current map state.
-    """
-
-    return map_engine.get_state()
-
-
-@app.get("/map")
-async def map_view() -> HTMLResponse:
+@mcp.custom_route("/map", methods=["GET"])
+async def map_view(request: Request) -> HTMLResponse:
     """
     Return a simple browser visualization of the current SVG map.
 
@@ -703,7 +697,6 @@ async def map_view() -> HTMLResponse:
     """
 
     result = map_engine.render()
-
     svg = result.get("svg", "")
 
     html = f"""
@@ -745,44 +738,83 @@ async def map_view() -> HTMLResponse:
     return HTMLResponse(content=html)
 
 
-@app.get("/map/json")
-async def map_json() -> JSONResponse:
+@mcp.custom_route("/map/json", methods=["GET"])
+async def map_json(request: Request) -> JSONResponse:
+    """Return the complete map as JSON."""
+
+    return JSONResponse(map_engine.get_state())
+
+
+class MCPOptionsBypassMiddleware:
     """
-    Return the complete map as JSON.
+    Answers bare OPTIONS requests to the MCP endpoint directly, before
+    they ever reach FastMCP's routing.
+
+    This can't be done as a normal Starlette route (even one
+    registered specifically for OPTIONS on this path): FastMCP's own
+    route for `streamable_http_path` is built with no `methods`
+    filter at all, so at the Starlette routing layer it matches
+    *every* HTTP method as a full match, including OPTIONS. Since
+    that route is always added to the app first, it always wins the
+    match before any later route — including one aimed only at
+    OPTIONS — is ever considered. Only once the request reaches
+    FastMCP's own ASGI handler does *it* decide OPTIONS isn't
+    supported, and return a bare error.
+
+    Middleware runs before routing, so intercepting here sidesteps
+    that ordering entirely, regardless of how FastMCP orders its
+    internal route list internally (now or in a future version).
+
+    Only requests with *no* Origin header are intercepted. A real
+    browser CORS preflight always includes one, and those are left
+    to pass through untouched so CORSMiddleware (below) keeps
+    handling that case exactly as it already does.
     """
 
-    return JSONResponse(
-        content=map_engine.get_state()
-    )
+    def __init__(self, app: Any, mcp_path: str) -> None:
+        self.app = app
+        self.mcp_path = mcp_path
+
+    async def __call__(self, scope: Dict[str, Any], receive: Any, send: Any) -> None:
+        if (
+            scope.get("type") == "http"
+            and scope.get("method") == "OPTIONS"
+            and scope.get("path") == self.mcp_path
+        ):
+            header_names = {name for name, _ in scope.get("headers", [])}
+
+            if b"origin" not in header_names:
+                response = Response(
+                    status_code=204,
+                    headers={"Allow": "OPTIONS, GET, POST, DELETE"},
+                )
+                await response(scope, receive, send)
+                return
+
+        await self.app(scope, receive, send)
 
 
 # ============================================================
-# MCP MOUNT
+# ASGI APPLICATION
 # ============================================================
+# This *is* the app uvicorn runs — mcp.streamable_http_app() already
+# includes /mcp and every custom_route registered above, all as
+# routes on one Starlette instance, with the correct lifespan already
+# wired in by FastMCP itself. There is nothing left to compose.
 
-# Explicit OPTIONS handlers for the MCP endpoint. FastMCP's mounted
-# streamable-http route only declares GET, POST, DELETE, so a bare
-# OPTIONS request (the kind of capability probe some MCP clients,
-# including Claude's own connector setup flow, send before doing
-# anything else) hits the mount and gets a bare 405 back with no
-# CORS headers, since CORSMiddleware only handles OPTIONS requests
-# that carry an Origin header (real browser preflight) and otherwise
-# passes them straight through to the route. Registering these here,
-# before the mount, means they're matched first for OPTIONS
-# specifically, while GET/POST/DELETE continue through to the mount
-# exactly as before.
-@app.options("/mcp")
-@app.options("/mcp/")
-async def mcp_options() -> Response:
-    return Response(status_code=204, headers={"Allow": "OPTIONS, GET, POST, DELETE"})
+app = mcp.streamable_http_app()
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# mcp_app was already built above (before the FastAPI app existed)
-# so its lifespan could be wired in. Mount it here, after all the
-# plain HTTP routes are registered.
-app.mount(
-    "/mcp",
-    mcp_app,
+app.add_middleware(
+    MCPOptionsBypassMiddleware,
+    mcp_path="/mcp",
 )
 
 
